@@ -91,32 +91,79 @@ class SlackBot {
 	  });
 	
 	  // Approve challenge by ID
-	  this.app.command('/approve', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    const id = parseInt(command.text.trim(), 10);
-	    if (isNaN(id)) {
-	      await respond('⚠️ Usage: `/approve <challenge_id>`');
-	      return;
-	    }
-	
-	    try {
-	      await this.db.approveChallenge(id);
-	      await respond(`✅ Challenge ${id} approved and ready for posting.`);
-	    } catch (err) {
-	      console.error('Approve command failed:', err);
-	      await respond('❌ Failed to approve challenge.');
-	    }
-		
-		const postAtUnix = Math.floor(new Date(targetDateTime).getTime() / 1000);
+		this.app.command('/approve', async ({ command, ack, respond }) => {
+			await ack();
+					const args = command.text.trim().split(/\s+/);
+					const id = parseInt(args[0], 10);
 
-		await this.app.client.chat.scheduleMessage({
-			token: process.env.SLACK_BOT_TOKEN,
-			channel: process.env.SLACK_CHALLENGES_CHANNEL,
-			text: this.formatChallenge(challenge),
-			post_at: postAtUnix
+					if (isNaN(id)) {
+						await respond('⚠️ Usage: `/approve <challenge_id>`');
+						return;
+					}
+
+					try {
+						await this.db.approveChallenge(id);
+
+						// Get all scheduled_at values (ISO strings)
+						const scheduledList = await new Promise((resolve, reject) => {
+							this.db.all(
+								'SELECT scheduled_at FROM challenges WHERE scheduled_at IS NOT NULL',
+								(err, rows) => {
+									if (err) reject(err);
+									else resolve(rows.map(r => r.scheduled_at));
+								}
+							);
+						});
+
+						// Helper: get next available Tuesday 9:00
+						function getNextFreeTuesday(scheduledList) {
+							const now = new Date();
+							let candidate = new Date(now);
+							candidate.setHours(9, 0, 0, 0);
+							// Find next Tuesday
+							candidate.setDate(candidate.getDate() + ((9 - candidate.getDay()) % 7 || 7));
+							// If today is Tuesday and before 9:00, use today
+							if (now.getDay() === 2 && now.getHours() < 9) {
+								candidate = new Date(now);
+								candidate.setHours(9, 0, 0, 0);
+							}
+							// Loop until we find a free slot
+							while (scheduledList.includes(candidate.toISOString())) {
+								candidate.setDate(candidate.getDate() + 7);
+							}
+							return candidate;
+						}
+
+						const nextTuesday = getNextFreeTuesday(scheduledList);
+
+						// Update challenge with scheduled_at
+						await new Promise((resolve, reject) => {
+							this.db.run(
+								'UPDATE challenges SET scheduled_at = ? WHERE id = ?',
+								[nextTuesday.toISOString(), id],
+								err => (err ? reject(err) : resolve())
+							);
+						});
+
+						// Get challenge details
+						const challenge = await this.db.getChallengeById(id);
+						if (!challenge) {
+							await respond(`⚠️ Challenge ${id} not found.`);
+							return;
+						}
+						const postAtUnix = Math.floor(nextTuesday.getTime() / 1000);
+						await this.app.client.chat.scheduleMessage({
+							token: process.env.SLACK_BOT_TOKEN,
+							channel: process.env.SLACK_CHALLENGES_CHANNEL,
+							text: this.formatChallenge(challenge),
+							post_at: postAtUnix
+						});
+						await respond(`✅ Challenge ${id} approved and scheduled for posting at ${nextTuesday.toLocaleString()}.`);
+					} catch (err) {
+						console.error('Approve command failed:', err);
+						await respond('❌ Failed to approve challenge.');
+					}
 		});
-	  });
 	
 	  // Reorder challenge in queue
 	  this.app.command('/reorder', async ({ command, ack, respond }) => {

@@ -23,6 +23,11 @@ class AIClient {
           continue; // try again with another ID
         }
 
+        // Only return challenge if difficulty matches (case-insensitive)
+        if (difficulty && data.difficulty && data.difficulty.toLowerCase() !== difficulty.toLowerCase()) {
+          continue;
+        }
+
         const challenge = {
           title: data.title,
           description: this.stripHtml(data.content),
@@ -40,7 +45,7 @@ class AIClient {
 
     // If all retries fail, return fallback
     console.error('Failed to fetch a valid challenge after multiple attempts.');
-    return this.getFallbackChallenge('medium');
+    return this.getFallbackChallenge(difficulty);
   }
 
   stripHtml(html) {

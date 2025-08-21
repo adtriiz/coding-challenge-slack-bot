@@ -23,9 +23,18 @@ class Database {
           position INTEGER,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           used_at TIMESTAMP,
-          slack_ts TEXT
+          slack_ts TEXT,
+          scheduled_at TIMESTAMP
         )
       `);
+
+      // Migration: add scheduled_at column if missing
+      this.db.get("PRAGMA table_info(challenges)", (err, info) => {
+        if (err) return;
+        if (Array.isArray(info) && !info.some(col => col.name === 'scheduled_at')) {
+          this.db.run("ALTER TABLE challenges ADD COLUMN scheduled_at TIMESTAMP");
+        }
+      });
 
       this.db.run(`
         CREATE TABLE IF NOT EXISTS submissions (

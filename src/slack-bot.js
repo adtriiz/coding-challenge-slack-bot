@@ -18,11 +18,11 @@ class SlackBot {
 	  // Generate challenge (via Leetcode API)
 	  this.app.command('/generate', async ({ command, ack, respond }) => {
 	    await ack();
+		await respond(`🎲 Fetching a random challenge...`);
 	
 	    try {
 	      const difficulty = command.text.trim() || 'medium'; // Optional argument
 	
-	      await respond(`🎲 Fetching a random challenge...`);
 	
 	      const challenge = await this.aiClient.generateChallenge(difficulty);
 	      const id = await this.db.saveChallenge(challenge);

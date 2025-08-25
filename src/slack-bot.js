@@ -17,21 +17,29 @@ class SlackBot {
 	setupCommands() {
 	  // Generate challenge (via Leetcode API)
 	  this.app.command('/generate', async ({ command, ack, respond }) => {
-	    await ack();
-		await respond(`🎲 Fetching a random challenge...`);
-	
-	    try {
-	      const difficulty = command.text.trim() || 'medium'; // Optional argument
-	
-	
-	      const challenge = await this.aiClient.generateChallenge(difficulty);
-	      const id = await this.db.saveChallenge(challenge);
-	
-	      await respond(`✅ Added *${challenge.title}* (${challenge.difficulty}) to queue with ID ${id}.`);
-	    } catch (error) {
-	      console.error('Generate command failed:', error);
-	      await respond('❌ Failed to generate challenge. Please try again.');
-	    }
+			await ack();
+			await respond(`🎲 Fetching a random challenge...`);
+
+			// Do the slow work asynchronously
+			(async () => {
+				try {
+					const difficulty = command.text.trim() || 'medium';
+					const challenge = await this.aiClient.generateChallenge(difficulty);
+					const id = await this.db.saveChallenge(challenge);
+
+					// Send follow-up message to the user/channel
+					await this.app.client.chat.postMessage({
+						channel: command.channel_id,
+						text: `✅ Added *${challenge.title}* (${challenge.difficulty}) to queue with ID ${id}.`,
+					});
+				} catch (error) {
+					console.error('Generate command failed:', error);
+					await this.app.client.chat.postMessage({
+						channel: command.channel_id,
+						text: '❌ Failed to generate challenge. Please try again.',
+					});
+				}
+			})();
 	  });
 	
 	  // Post next approved challenge

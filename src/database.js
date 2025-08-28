@@ -25,6 +25,7 @@ class Database {
           scheduled_post_at INTEGER, -- epoch seconds (Slack post_at)
           scheduled_message_id TEXT, -- Slack scheduled message id
           slack_ts TEXT -- optional: real posted ts (if we later confirm delivery)
+        )
       `);
     });
   }

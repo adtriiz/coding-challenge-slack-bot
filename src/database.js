@@ -234,8 +234,8 @@ class Database {
       // Get all approved/scheduled challenges ordered by scheduled_post_at
       this.db.all(`SELECT id FROM challenges WHERE status IN ('approved', 'scheduled') ORDER BY scheduled_post_at ASC, id ASC`, [], (err, approvedRows) => {
         if (err) return reject(err);
-        // Get all pending challenges ordered by created_at
-        this.db.all(`SELECT id FROM challenges WHERE status = 'pending' ORDER BY created_at ASC, id ASC`, [], (err2, pendingRows) => {
+        // Get all pending challenges ordered by manual position
+        this.db.all(`SELECT id FROM challenges WHERE status = 'pending' ORDER BY position ASC, id ASC`, [], (err2, pendingRows) => {
           if (err2) return reject(err2);
           let updates = [];
           let pos = 1;

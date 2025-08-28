@@ -22,153 +22,86 @@ class Database {
           status TEXT DEFAULT 'pending',
           position INTEGER,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          used_at TIMESTAMP,
-          slack_ts TEXT,
-          scheduled_at TIMESTAMP
-        )
+          scheduled_post_at INTEGER, -- epoch seconds (Slack post_at)
+          scheduled_message_id TEXT, -- Slack scheduled message id
+          slack_ts TEXT -- optional: real posted ts (if we later confirm delivery)
       `);
+    });
+  }
 
-      // Migration: add scheduled_at column if missing
-      this.db.get("PRAGMA table_info(challenges)", (err, info) => {
-        if (err) return;
-        if (Array.isArray(info) && !info.some(col => col.name === 'scheduled_at')) {
-          this.db.run("ALTER TABLE challenges ADD COLUMN scheduled_at TIMESTAMP");
+  saveChallenge(ch) {
+    return new Promise((resolve, reject) => {
+      this.db.run(
+        `INSERT INTO challenges (title, description, difficulty, function_stub, example, url, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+        [ch.title, ch.description, ch.difficulty, ch.function_stub, ch.example, ch.url],
+        function (err) {
+          if (err) reject(err);
+          else resolve(this.lastID);
         }
-      });
-
-      this.db.run(`
-        CREATE TABLE IF NOT EXISTS submissions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          challenge_id INTEGER,
-          user_id TEXT NOT NULL,
-          username TEXT NOT NULL,
-          submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY (challenge_id) REFERENCES challenges(id)
-        )
-      `);
+      );
     });
   }
 
-  async saveChallenge(challenge) {
+  getChallengeById(id) {
     return new Promise((resolve, reject) => {
-      this.db.run(`
-        INSERT INTO challenges (title, description, difficulty, function_stub, example, url, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
-      `, [
-        challenge.title,
-        challenge.description,
-        challenge.difficulty,
-        challenge.function_stub,
-        challenge.example,
-        challenge.url
-      ], function(err) {
-        if (err) reject(err);
-        else resolve(this.lastID);
-      });
-    });
-  }
-
-  async getNextChallenge() {
-    return new Promise((resolve, reject) => {
-      this.db.get(`
-        SELECT * FROM challenges
-        WHERE status = 'approved'
-        ORDER BY 
-          CASE WHEN position IS NULL THEN 9999 ELSE position END ASC,
-          created_at ASC
-        LIMIT 1
-      `, (err, row) => {
+      this.db.get(`SELECT * FROM challenges WHERE id = ?`, [id], (err, row) => {
         if (err) reject(err);
         else resolve(row);
       });
     });
   }
 
-  async markAsUsed(id, slackTs) {
+  getQueue(includeUsed = false) {
     return new Promise((resolve, reject) => {
-      this.db.run(`
-        UPDATE challenges 
-        SET used_at = CURRENT_TIMESTAMP, slack_ts = ?, status = 'used'
-        WHERE id = ?
-      `, [slackTs, id], (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
+      this.db.all(
+        `SELECT id, title, difficulty, status, position, scheduled_post_at, scheduled_message_id
+         FROM challenges
+         WHERE ${includeUsed ? '1=1' : "status != 'used'"}
+         ORDER BY CASE WHEN position IS NULL THEN 9999 ELSE position END ASC, created_at ASC`,
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
     });
   }
 
-  async getQueueStatus() {
+  approveChallenge(id) {
     return new Promise((resolve, reject) => {
-      this.db.get(`
-        SELECT COUNT(*) as count FROM challenges WHERE status = 'approved'
-      `, (err, row) => {
-        if (err) reject(err);
-        else resolve(row.count);
-      });
+      this.db.run(
+        `UPDATE challenges SET status = 'approved' WHERE id = ?`,
+        [id],
+        (err) => (err ? reject(err) : resolve())
+      );
     });
   }
 
-  async getChallengeQueue() {
+  markScheduled(id, postAtEpoch, scheduledMessageId) {
     return new Promise((resolve, reject) => {
-      this.db.all(`
-        SELECT id, title, difficulty, status, position 
-        FROM challenges 
-        WHERE status != 'used'
-        ORDER BY 
-          CASE WHEN position IS NULL THEN 9999 ELSE position END ASC,
-          created_at ASC
-      `, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
+      this.db.run(
+        `UPDATE challenges
+         SET status = 'scheduled', scheduled_post_at = ?, scheduled_message_id = ?, position = NULL
+         WHERE id = ?`,
+        [postAtEpoch, scheduledMessageId, id],
+        (err) => (err ? reject(err) : resolve())
+      );
     });
   }
 
-  async approveChallenge(id) {
+  reorderChallenge(id, position) {
     return new Promise((resolve, reject) => {
-      this.db.run(`
-        UPDATE challenges
-        SET status = 'approved'
-        WHERE id = ?
-      `, [id], (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
+      this.db.run(
+        `UPDATE challenges SET position = ? WHERE id = ?`,
+        [position, id],
+        (err) => (err ? reject(err) : resolve())
+      );
     });
   }
 
-  async removeChallenge(id) {
+  removeChallenge(id) {
     return new Promise((resolve, reject) => {
-      this.db.run(`
-        DELETE FROM challenges WHERE id = ?
-      `, [id], (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  }
-
-  async reorderChallenge(id, newPosition) {
-    return new Promise((resolve, reject) => {
-      this.db.run(`
-        UPDATE challenges
-        SET position = ?
-        WHERE id = ?
-      `, [newPosition, id], (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  }
-
-  async getChallengeById(id) {
-    return new Promise((resolve, reject) => {
-      this.db.get(`
-        SELECT * FROM challenges WHERE id = ?
-      `, [id], (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-      });
+      this.db.run(`DELETE FROM challenges WHERE id = ?`, [id], (err) => (err ? reject(err) : resolve()));
     });
   }
 }

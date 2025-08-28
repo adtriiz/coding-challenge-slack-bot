@@ -12,10 +12,11 @@
   "license": "ISC",
   "dependencies": {
     "@slack/bolt": "^4.4.0",
-    "axios": "^1.10.0",
-    "dotenv": "^17.1.0",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "he": "^1.2.0",
+    "luxon": "^3.7.1",
     "sqlite3": "^5.1.7"
   },
   "devDependencies": {

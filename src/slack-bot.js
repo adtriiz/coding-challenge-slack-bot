@@ -1,313 +1,291 @@
 const { App } = require('@slack/bolt');
+const { DateTime } = require('luxon');
 const Database = require('./database');
 const AIClient = require('./ai-client');
+
+const TZ = 'Africa/Nairobi'; // EAT (UTC+3)
 
 class SlackBot {
   constructor() {
     this.app = new App({
       token: process.env.SLACK_BOT_TOKEN,
       signingSecret: process.env.SLACK_SIGNING_SECRET
+      // Default Bolt receiver exposes POST /slack/events for commands/events
     });
-    
     this.db = new Database();
-    this.aiClient = new AIClient();
+    this.ai = new AIClient();
     this.setupCommands();
   }
 
-	setupCommands() {
-	  // Generate challenge (via Leetcode API)
-	  this.app.command('/generate', async ({ command, ack, respond }) => {
-			await ack();
-			await respond(`🎲 Fetching a random challenge...`);
+  setupCommands() {
+    // Generate → pending
+    this.app.command('/generate', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
 
-			// Do the slow work asynchronously
-			(async () => {
-				try {
-					const difficulty = command.text.trim() || 'medium';
-					const challenge = await this.aiClient.generateChallenge(difficulty);
-					const id = await this.db.saveChallenge(challenge);
-
-					// Send follow-up message to the user/channel
-					await this.app.client.chat.postMessage({
-						channel: command.channel_id,
-						text: `✅ Added *${challenge.title}* (${challenge.difficulty}) to queue with ID ${id}.`,
-					});
-				} catch (error) {
-					console.error('Generate command failed:', error);
-					await this.app.client.chat.postMessage({
-						channel: command.channel_id,
-						text: '❌ Failed to generate challenge. Please try again.',
-					});
-				}
-			})();
-	  });
-	
-	  // Post next approved challenge
-	  this.app.command('/post', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    try {
-	      const challenge = await this.db.getNextChallenge();
-	
-	      if (!challenge) {
-	        await respond('🚫 No approved challenges available. Use `/approve <id>` first.');
-	        return;
-	      }
-	
-	      const result = await this.postChallenge(challenge);
-	      await respond(`✅ Posted: *${challenge.title}*`);
-	    } catch (error) {
-	      console.error('Post command failed:', error);
-	      await respond('❌ Failed to post challenge.');
-	    }
-	  });
-	
-	  // Check challenge queue status
-	  this.app.command('/queuestatus', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    try {
-	      const count = await this.db.getQueueStatus();
-	      await respond(`📊 Queue status: ${count} approved challenge(s) ready to post.`);
-	    } catch (error) {
-	      console.error('Status command failed:', error);
-	      await respond('❌ Failed to retrieve queue status.');
-	    }
-	  });
-	
-	  // Show full queue of pending/approved challenges
-	  this.app.command('/queue', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    try {
-	      const list = await this.db.getChallengeQueue();
-	
-	      if (list.length === 0) {
-	        await respond('📭 The challenge queue is empty.');
-	        return;
-	      }
-	
-	      const text = list.map(c =>
-	        `• *${c.id}: ${c.title}* (${c.difficulty}) – _${c.status}_ – position: ${c.position ?? '—'}`
-	      ).join('\n');
-	
-	      await respond(`📋 *Challenge Queue:*\n${text}`);
-	    } catch (err) {
-	      console.error('Queue command failed:', err);
-	      await respond('❌ Failed to fetch queue.');
-	    }
-	  });
-	
-	  // Approve challenge by ID
-		this.app.command('/approve', async ({ command, ack, respond }) => {
-			await ack();
-					const args = command.text.trim().split(/\s+/);
-					const id = parseInt(args[0], 10);
-
-					if (isNaN(id)) {
-						await respond('⚠️ Usage: `/approve <challenge_id>`');
-						return;
-					}
-
-					try {
-						await this.db.approveChallenge(id);
-
-						// Get all scheduled_at values (ISO strings)
-						const scheduledList = await new Promise((resolve, reject) => {
-							this.db.all(
-								'SELECT scheduled_at FROM challenges WHERE scheduled_at IS NOT NULL',
-								(err, rows) => {
-									if (err) reject(err);
-									else resolve(rows.map(r => r.scheduled_at));
-								}
-							);
-						});
-
-						// Helper: get next available Tuesday 9:00
-						function getNextFreeTuesday(scheduledList) {
-							const now = new Date();
-							let candidate = new Date(now);
-							candidate.setHours(9, 0, 0, 0);
-							// Find next Tuesday
-							candidate.setDate(candidate.getDate() + ((9 - candidate.getDay()) % 7 || 7));
-							// If today is Tuesday and before 9:00, use today
-							if (now.getDay() === 2 && now.getHours() < 9) {
-								candidate = new Date(now);
-								candidate.setHours(9, 0, 0, 0);
-							}
-							// Loop until we find a free slot
-							while (scheduledList.includes(candidate.toISOString())) {
-								candidate.setDate(candidate.getDate() + 7);
-							}
-							return candidate;
-						}
-
-						const nextTuesday = getNextFreeTuesday(scheduledList);
-
-						// Update challenge with scheduled_at
-						await new Promise((resolve, reject) => {
-							this.db.run(
-								'UPDATE challenges SET scheduled_at = ? WHERE id = ?',
-								[nextTuesday.toISOString(), id],
-								err => (err ? reject(err) : resolve())
-							);
-						});
-
-						// Get challenge details
-						const challenge = await this.db.getChallengeById(id);
-						if (!challenge) {
-							await respond(`⚠️ Challenge ${id} not found.`);
-							return;
-						}
-						const postAtUnix = Math.floor(nextTuesday.getTime() / 1000);
-						await this.app.client.chat.scheduleMessage({
-							token: process.env.SLACK_BOT_TOKEN,
-							channel: process.env.SLACK_CHALLENGES_CHANNEL,
-							text: this.formatChallenge(challenge),
-							post_at: postAtUnix
-						});
-						await respond(`✅ Challenge ${id} approved and scheduled for posting at ${nextTuesday.toLocaleString()}.`);
-					} catch (err) {
-						console.error('Approve command failed:', err);
-						await respond('❌ Failed to approve challenge.');
-					}
-		});
-	
-	  // Reorder challenge in queue
-	  this.app.command('/reorder', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    const [idStr, posStr] = command.text.trim().split(/\s+/);
-	    const id = parseInt(idStr, 10);
-	    const position = parseInt(posStr, 10);
-	
-	    if (isNaN(id) || isNaN(position)) {
-	      await respond('⚠️ Usage: `/reorder <challenge_id> <position>`');
-	      return;
-	    }
-	
-	    try {
-	      await this.db.reorderChallenge(id, position);
-	      await respond(`✅ Challenge ${id} moved to position ${position}.`);
-	    } catch (err) {
-	      console.error('Reorder command failed:', err);
-	      await respond('❌ Failed to reorder challenge.');
-	    }
-	  });
-	
-	  // Remove challenge from queue
-	  this.app.command('/delete', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    const id = parseInt(command.text.trim(), 10);
-	    if (isNaN(id)) {
-	      await respond('⚠️ Usage: `/delete <challenge_id>`');
-	      return;
-	    }
-	
-	    try {
-	      await this.db.removeChallenge(id);
-	      await respond(`🗑️ Challenge ${id} removed from queue.`);
-	    } catch (err) {
-	      console.error('Remove command failed:', err);
-	      await respond('❌ Failed to remove challenge.');
-	    }
-	  });
-	
-	  // Preview challenge by ID
-	  this.app.command('/preview', async ({ command, ack, respond }) => {
-	    await ack();
-	
-	    const id = parseInt(command.text.trim(), 10);
-	    if (isNaN(id)) {
-	      await respond('⚠️ Usage: `/preview <challenge_id>`');
-	      return;
-	    }
-	
-	    try {
-	      const challenge = await this.db.getChallengeById(id);
-	
-	      if (!challenge) {
-	        await respond(`❓ No challenge found with ID ${id}`);
-	        return;
-	      }
-	
-	      const text = `
-		🧩 *[${challenge.difficulty.toUpperCase()}]* *${challenge.title}*
-		
-		${challenge.description}
-		
-		*Example:*
-		${challenge.example}
-		
-		*Function to complete:*
-		\`\`\`javascript
-		${challenge.function_stub}
-		\`\`\`
-		
-		<${challenge.url}|🔗 View on Leetcode>
-		
-		_Status: ${challenge.status} • Position: ${challenge.position ?? '—'}_
-		      `.trim();
-		
-		      await respond({ text });
-		    } catch (err) {
-		      console.error('Preview command failed:', err);
-		      await respond('❌ Failed to preview challenge.');
-		    }
-		  });
-	}
-
-
-  async postChallenge(challenge) {
-    const challengeText = this.formatChallenge(challenge);
-    
-    const result = await this.app.client.chat.postMessage({
-      token: process.env.SLACK_BOT_TOKEN,
-      channel: process.env.SLACK_CHALLENGES_CHANNEL,
-      text: challengeText,
-      blocks: [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: challengeText
-          }
-        }
-      ]
+      const difficulty = (command.text || 'medium').trim().toLowerCase();
+      await respond(`🎲 Generating a random "${difficulty}" challenge...`);
+      try {
+        const ch = await this.ai.generateChallenge(difficulty);
+        const id = await this.db.saveChallenge(ch);
+        await respond(`✅ Added *${ch.title}* (${ch.difficulty}) with ID \`${id}\`. Use \`/approve ${id}\` to schedule.`);
+      } catch (e) {
+        console.error('generate error', e);
+        await respond('❌ Failed to generate challenge.');
+      }
     });
 
-    // Mark as used
-    await this.db.markAsUsed(challenge.id, result.ts);
-    
-    return result;
+    // Approve & schedule: /approve <id> [YYYY-MM-DD HH:mm]
+    this.app.command('/approve', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      const args = command.text.trim();
+      if (!args) return respond('⚠️ Usage: `/approve <id> [YYYY-MM-DD HH:mm]` (time in EAT)');
+
+      const [idStr, ...rest] = args.split(/\s+/);
+      const id = parseInt(idStr, 10);
+      if (Number.isNaN(id)) return respond('⚠️ First argument must be a numeric ID.');
+
+      try {
+        await this.db.approveChallenge(id);
+        const ch = await this.db.getChallengeById(id);
+        if (!ch) return respond(`❓ Challenge ${id} not found.`);
+
+        const whenText = rest.join(' ').trim();
+        const postAt = whenText ? this.parseToEpoch(whenText) : this.nextTuesdayNine();
+        if (!postAt || postAt <= Math.floor(Date.now()/1000)) {
+          return respond('⚠️ Invalid or past datetime. Use `YYYY-MM-DD HH:mm` (EAT).');
+        }
+
+        const { scheduled_message_id } = await this.scheduleChallenge(ch, postAt);
+        await respond(`📅 Scheduled *${ch.title}* for <t:${postAt}:F> EAT. (scheduled_message_id: \`${scheduled_message_id}\`)`);
+      } catch (e) {
+        console.error('approve error', e);
+        await respond('❌ Failed to approve/schedule challenge.');
+      }
+    });
+
+    // Autoschedule next N Tuesdays at 09:00 EAT
+    this.app.command('/autoschedule', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      const count = Math.max(1, parseInt(command.text.trim(), 10) || 4);
+      try {
+        const queue = await this.db.getQueue(false);
+        const approved = queue.filter(q => q.status === 'approved');
+        if (approved.length === 0) return respond('📭 No approved challenges to schedule.');
+
+        const targets = this.nextNTuesdaysNine(count);
+        let i = 0, scheduledCount = 0;
+        for (const item of approved) {
+          if (i >= targets.length) break;
+          const postAt = targets[i++];
+          const full = await this.db.getChallengeById(item.id);
+          const { scheduled_message_id } = await this.scheduleChallenge(full, postAt);
+          scheduledCount++;
+          await respond(`✅ Scheduled *${full.title}* for <t:${postAt}:F> EAT (id: ${full.id}, smid: \`${scheduled_message_id}\`).`);
+        }
+        if (scheduledCount === 0) {
+          await respond('ℹ️ No items scheduled — not enough upcoming slots or empty queue.');
+        }
+      } catch (e) {
+        console.error('autoschedule error', e);
+        await respond('❌ Failed to autoschedule.');
+      }
+    });
+
+    // Queue
+    this.app.command('/queue', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      try {
+        const list = await this.db.getQueue();
+        if (list.length === 0) return respond('📭 The challenge queue is empty.');
+        const lines = list.map(c =>
+          `• *${c.id}: ${c.title}* (${c.difficulty}) – _${c.status}_ – pos: ${c.position ?? '—'}${c.scheduled_post_at ? ` – <t:${c.scheduled_post_at}:F>` : ''}${c.scheduled_message_id ? ` – smid: \`${c.scheduled_message_id}\`` : ''}`
+        );
+        await respond(`📋 *Challenge Queue:*\n${lines.join('\n')}`);
+      } catch (e) {
+        console.error('queue error', e);
+        await respond('❌ Failed to fetch queue.');
+      }
+    });
+
+    // Reorder
+    this.app.command('/reorder', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      const [idStr, posStr] = (command.text || '').trim().split(/\s+/);
+      const id = parseInt(idStr, 10);
+      const pos = parseInt(posStr, 10);
+      if (Number.isNaN(id) || Number.isNaN(pos)) return respond('⚠️ Usage: `/reorder <id> <position>`');
+      try {
+        await this.db.reorderChallenge(id, pos);
+        await respond(`✅ Challenge ${id} moved to position ${pos}.`);
+      } catch (e) {
+        console.error('reorder error', e);
+        await respond('❌ Failed to reorder challenge.');
+      }
+    });
+
+    // Delete
+    this.app.command('/delete', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      const id = parseInt((command.text || '').trim(), 10);
+      if (Number.isNaN(id)) return respond('⚠️ Usage: `/delete <id>`');
+      try {
+        await this.db.removeChallenge(id);
+        await respond(`🗑️ Challenge ${id} removed.`);
+      } catch (e) {
+        console.error('delete error', e);
+        await respond('❌ Failed to delete challenge.');
+      }
+    });
+
+    // Preview
+    this.app.command('/preview', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      const id = parseInt((command.text || '').trim(), 10);
+      if (Number.isNaN(id)) return respond('⚠️ Usage: `/preview <id>`');
+      try {
+        const ch = await this.db.getChallengeById(id);
+        if (!ch) return respond(`❓ No challenge with ID ${id}`);
+        const text = this.formatChallenge(ch);
+        await respond({ text });
+      } catch (e) {
+        console.error('preview error', e);
+        await respond('❌ Failed to preview challenge.');
+      }
+    });
+
+    // List scheduled messages
+    this.app.command('/scheduled', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      try {
+        const out = await this.app.client.chat.scheduledMessages.list({
+          token: process.env.SLACK_BOT_TOKEN,
+          channel: process.env.SLACK_CHALLENGES_CHANNEL
+        });
+        if (!out || !out.scheduled_messages || out.scheduled_messages.length === 0) {
+          return respond('🗓️ No scheduled messages found for the channel.');
+        }
+        const lines = out.scheduled_messages.map(m =>
+          `• smid: \`${m.id}\` – post_at: <t:${m.post_at}:F> – text: ${this.truncate(m.text, 60)}`
+        );
+        await respond(`🗓️ *Scheduled Messages:*\n${lines.join('\n')}`);
+      } catch (e) {
+        console.error('scheduled list error', e);
+        await respond('❌ Failed to list scheduled messages.');
+      }
+    });
+
+    // Unschedule
+    this.app.command('/unschedule', async ({ command, ack, respond }) => {
+      await ack();
+      if (!(await this.requireAdminChannel(command, respond))) return;
+
+      const smid = (command.text || '').trim();
+      if (!smid) return respond('⚠️ Usage: `/unschedule <scheduled_message_id>`');
+      try {
+        await this.app.client.chat.deleteScheduledMessage({
+          token: process.env.SLACK_BOT_TOKEN,
+          channel: process.env.SLACK_CHALLENGES_CHANNEL,
+          scheduled_message_id: smid
+        });
+        await respond(`🗑️ Unscheduled message \`${smid}\`.`);
+      } catch (e) {
+        console.error('unschedule error', e);
+        await respond('❌ Failed to unschedule message (check id).');
+      }
+    });
   }
 
-  formatChallenge(challenge) {
+  // ---- Helpers ----
+  async requireAdminChannel(command, respond) {
+    const adminChannel = process.env.SLACK_ADMIN_CHANNEL;
+    if (command.channel_id !== adminChannel) {
+      await respond('⛔ This command must be used in the admin channel.');
+      return false;
+    }
+    return true;
+  }
+
+  truncate(s, n) { return s && s.length > n ? s.slice(0, n-1) + '…' : s; }
+
+  nextTuesdayNine() {
+    const now = DateTime.now().setZone(TZ);
+    const weekday = now.weekday; // 1..7 (Mon..Sun)
+    const daysUntilTue = (2 - weekday + 7) % 7 || 7; // next Tuesday (not today)
+    const dt = now.plus({ days: daysUntilTue }).set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+    return Math.floor(dt.toSeconds());
+  }
+
+  nextNTuesdaysNine(n) {
+    const arr = [];
+    let ts = this.nextTuesdayNine();
+    for (let i = 0; i < n; i++) {
+      arr.push(ts);
+      ts += 7 * 24 * 60 * 60; // week
+    }
+    return arr;
+  }
+
+  parseToEpoch(text) {
+    // Expect "YYYY-MM-DD HH:mm" in EAT
+    const dt = DateTime.fromFormat(text, 'yyyy-LL-dd HH:mm', { zone: TZ });
+    if (!dt.isValid) return null;
+    return Math.floor(dt.toSeconds());
+  }
+
+  formatChallenge(ch) {
     return `
-🧩 **Weekly Coding Challenge** - ${challenge.difficulty.toUpperCase()}
+🧩 *Weekly Coding Challenge* — ${String(ch.difficulty || '').toUpperCase()}
 
-**${challenge.title}**
+*${ch.title}*
 
-${challenge.description}
+${ch.description}
 
-**Example:**
-${challenge.example}
+*Example:*
+${ch.example}
 
-**Function to complete:**
+*Function to complete:*
 \`\`\`javascript
-${challenge.function_stub}
+${ch.function_stub}
 \`\`\`
 
-**Leetcode Link:** <${challenge.url}>
+${ch.url ? `*LeetCode Link:* <${ch.url}>` : ''}
 
 Reply in this thread with your solution! 🚀
     `.trim();
   }
 
+  async scheduleChallenge(ch, postAtEpoch) {
+    const text = this.formatChallenge(ch);
+    const res = await this.app.client.chat.scheduleMessage({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: process.env.SLACK_CHALLENGES_CHANNEL,
+      text,
+      post_at: postAtEpoch,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }]
+    });
+    const scheduled_message_id = res.scheduled_message_id || (res.message ? res.message.scheduled_message_id : null);
+    await this.db.markScheduled(ch.id, postAtEpoch, scheduled_message_id || null);
+    return { scheduled_message_id };
+  }
+
   async start() {
     await this.app.start(process.env.PORT || 3000);
-    console.log('⚡️ Slack bot is running!');
+    console.log('⚡️ Slack bot is running (Render-ready). Endpoint: POST /slack/events');
   }
 }
 

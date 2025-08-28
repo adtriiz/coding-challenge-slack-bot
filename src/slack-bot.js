@@ -6,6 +6,15 @@ const AIClient = require('./ai-client');
 const TZ = 'Africa/Nairobi'; // EAT (UTC+3)
 
 class SlackBot {
+  // Archive a challenge after publishing
+  async archivePublishedChallenge(challengeId) {
+    try {
+      await this.db.archiveChallenge(challengeId);
+      console.log(`Challenge ${challengeId} archived after publishing.`);
+    } catch (e) {
+      console.error(`Failed to archive challenge ${challengeId}:`, e);
+    }
+  }
   constructor() {
     this.app = new App({
       token: process.env.SLACK_BOT_TOKEN,
@@ -102,10 +111,19 @@ class SlackBot {
       if (!(await this.requireAdminChannel(command, respond))) return;
 
       try {
+        // Archive published challenges before showing queue
+        const now = Math.floor(Date.now() / 1000);
         const list = await this.db.getQueue();
-        if (list.length === 0) return respond('📭 The challenge queue is empty.');
-        const lines = list.map(c =>
-          `• *${c.id}: ${c.title}* (${c.difficulty}) – _${c.status}_ – pos: ${c.position ?? '—'}${c.scheduled_post_at ? ` – <t:${c.scheduled_post_at}:F>` : ''}${c.scheduled_message_id ? ` – smid: \`${c.scheduled_message_id}\`` : ''}`
+        for (const c of list) {
+          if ((c.status === 'approved' || c.status === 'scheduled') && c.scheduled_post_at && c.scheduled_post_at < now) {
+            await this.archivePublishedChallenge(c.id);
+          }
+        }
+        // Fetch updated queue after archiving
+        const updatedList = await this.db.getQueue();
+        if (updatedList.length === 0) return respond('📭 The challenge queue is empty.');
+        const lines = updatedList.map(c =>
+          `• *${c.id}: ${c.title}* (${c.difficulty}) – _${c.status}_ – pos: ${c.position}${c.scheduled_post_at ? ` – <t:${c.scheduled_post_at}:F>` : ''}${c.scheduled_message_id ? ` – smid: \`${c.scheduled_message_id}\`` : ''}`
         );
         await respond(`📋 *Challenge Queue:*\n${lines.join('\n')}`);
       } catch (e) {
@@ -124,6 +142,11 @@ class SlackBot {
       const pos = parseInt(posStr, 10);
       if (Number.isNaN(id) || Number.isNaN(pos)) return respond('⚠️ Usage: `/reorder <id> <position>`');
       try {
+        const ch = await this.db.getChallengeById(id);
+        if (!ch) return respond(`❓ Challenge ${id} not found.`);
+        if (ch.status !== 'pending') {
+          return respond('⚠️ Only pending challenges can be reordered.');
+        }
         await this.db.reorderChallenge(id, pos);
         await respond(`✅ Challenge ${id} moved to position ${pos}.`);
       } catch (e) {
@@ -202,7 +225,14 @@ class SlackBot {
           channel: process.env.SLACK_CHALLENGES_CHANNEL,
           scheduled_message_id: smid
         });
-        await respond(`🗑️ Unscheduled message \`${smid}\`.`);
+        // Find challenge by scheduled_message_id
+        const ch = await this.db.getChallengeByScheduledMessageId(smid);
+        if (ch) {
+          await this.db.unscheduleChallenge(ch.id);
+          await respond(`🗑️ Unscheduled message \`${smid}\` and moved challenge \`${ch.id}\` back to pending.`);
+        } else {
+          await respond(`🗑️ Unscheduled message \`${smid}\`. No matching challenge found in database.`);
+        }
       } catch (e) {
         console.error('unschedule error', e);
         await respond('❌ Failed to unschedule message (check id).');

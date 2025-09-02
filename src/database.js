@@ -1,264 +1,182 @@
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+// src/database.js
+const { Pool } = require('pg');
 
 class Database {
-
   constructor() {
-    const dbPath = path.join(__dirname, '..', 'challenges.db');
-    this.db = new sqlite3.Database(dbPath);
-    this.init();
-  }
-
-  init() {
-    this.db.serialize(() => {
-      // Main queue table: pending, approved, scheduled
-      this.db.run(`
-        CREATE TABLE IF NOT EXISTS challenges (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          title TEXT NOT NULL,
-          description TEXT NOT NULL,
-          difficulty TEXT NOT NULL,
-          function_stub TEXT NOT NULL,
-          example TEXT NOT NULL,
-          url TEXT,
-          status TEXT CHECK(status IN ('pending', 'approved', 'scheduled')) DEFAULT 'pending',
-          position INTEGER, -- for pending only, contiguous
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          scheduled_post_at INTEGER, -- epoch seconds (Slack post_at)
-          scheduled_message_id TEXT, -- Slack scheduled message id
-          slack_ts TEXT -- optional: real posted ts (if we later confirm delivery)
-        )
-      `);
-
-      // Archive table for published challenges
-      this.db.run(`
-        CREATE TABLE IF NOT EXISTS published_challenges (
-          id INTEGER PRIMARY KEY,
-          title TEXT NOT NULL,
-          description TEXT NOT NULL,
-          difficulty TEXT NOT NULL,
-          function_stub TEXT NOT NULL,
-          example TEXT NOT NULL,
-          url TEXT,
-          status TEXT,
-          position INTEGER,
-          created_at TIMESTAMP,
-          scheduled_post_at INTEGER,
-          scheduled_message_id TEXT,
-          slack_ts TEXT,
-          published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
+    this.pool = new Pool({
+      connectionString: process.env.DATABASE_URL, // Supabase/Postgres connection string
+      ssl: { rejectUnauthorized: false }
     });
   }
 
-  getChallengeByScheduledMessageId(scheduledMessageId) {
-    return new Promise((resolve, reject) => {
-      this.db.get(`SELECT * FROM challenges WHERE scheduled_message_id = ?`, [scheduledMessageId], (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-      });
-    });
+  async getChallengeByScheduledMessageId(scheduledMessageId) {
+    const res = await this.pool.query(
+      `SELECT * FROM challenges WHERE scheduled_message_id = $1`,
+      [scheduledMessageId]
+    );
+    return res.rows[0];
   }
 
-  archiveChallenge(id) {
-    return new Promise((resolve, reject) => {
-      // Copy challenge to published_challenges and remove from challenges
-      this.db.get(`SELECT * FROM challenges WHERE id = ?`, [id], (err, row) => {
-        if (err) return reject(err);
-        if (!row) return resolve(); // nothing to archive
-        this.db.run(`
-          INSERT INTO published_challenges (
-            id, title, description, difficulty, function_stub, example, url, status, position, created_at, scheduled_post_at, scheduled_message_id, slack_ts
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [row.id, row.title, row.description, row.difficulty, row.function_stub, row.example, row.url, row.status, row.position, row.created_at, row.scheduled_post_at, row.scheduled_message_id, row.slack_ts], (err2) => {
-          if (err2) return reject(err2);
-          this.db.run(`DELETE FROM challenges WHERE id = ?`, [id], (err3) => {
-            if (err3) return reject(err3);
-            this.recalculatePositions().then(resolve).catch(reject);
-          });
-        });
-      });
-    });
-  }
-  unscheduleChallenge(id) {
-    return new Promise((resolve, reject) => {
-      this.db.run(`
-        UPDATE challenges
-        SET status = 'pending', scheduled_post_at = NULL, scheduled_message_id = NULL
-        WHERE id = ?
-      `, [id], (err) => {
-        if (err) return reject(err);
-        this.recalculatePositions().then(resolve).catch(reject);
-      });
-    });
+  async archiveChallenge(id) {
+    const res = await this.pool.query(
+      `SELECT * FROM challenges WHERE id = $1`,
+      [id]
+    );
+    if (res.rows.length === 0) return;
+
+    const row = res.rows[0];
+    await this.pool.query(
+      `INSERT INTO published_challenges (
+        id, title, description, difficulty, function_stub, example, url, status, position, created_at,
+        scheduled_post_at, scheduled_message_id, slack_ts
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ON CONFLICT (id) DO NOTHING`,
+      [
+        row.id, row.title, row.description, row.difficulty, row.function_stub,
+        row.example, row.url, row.status, row.position, row.created_at,
+        row.scheduled_post_at, row.scheduled_message_id, row.slack_ts
+      ]
+    );
+
+    await this.removeChallenge(id);
   }
 
-  saveChallenge(ch) {
-    return new Promise((resolve, reject) => {
-      // Find max position among pending
-      this.db.get(`SELECT MAX(position) as maxPos FROM challenges WHERE status = 'pending'`, (err, row) => {
-        if (err) return reject(err);
-        const pos = (row && row.maxPos) ? row.maxPos + 1 : 1;
-        this.db.run(
-          `INSERT INTO challenges (title, description, difficulty, function_stub, example, url, status, position)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
-          [ch.title, ch.description, ch.difficulty, ch.function_stub, ch.example, ch.url, pos],
-          function (err2) {
-            if (err2) reject(err2);
-            else resolve(this.lastID);
-          }
-        );
-      });
-    });
+  async unscheduleChallenge(id) {
+    await this.pool.query(
+      `UPDATE challenges
+       SET status = 'pending', scheduled_post_at = NULL, scheduled_message_id = NULL
+       WHERE id = $1`,
+      [id]
+    );
+    await this.recalculatePositions();
   }
 
-  getChallengeById(id) {
-    return new Promise((resolve, reject) => {
-      this.db.get(`SELECT * FROM challenges WHERE id = ?`, [id], (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-      });
-    });
+  async saveChallenge(ch) {
+    const res = await this.pool.query(
+      `INSERT INTO challenges (title, description, difficulty, function_stub, example, url, status, position)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending',
+         COALESCE((SELECT MAX(position) FROM challenges WHERE status = 'pending'), 0) + 1)
+       RETURNING id`,
+      [ch.title, ch.description, ch.difficulty, ch.function_stub, ch.example, ch.url]
+    );
+    return res.rows[0].id;
   }
 
-  getQueue(includeUsed = false) {
-    return new Promise((resolve, reject) => {
-      this.db.all(
-        `SELECT id, title, difficulty, status, position, scheduled_post_at, scheduled_message_id
-         FROM challenges
-         WHERE ${includeUsed ? '1=1' : "status != 'used'"}
-         ORDER BY CASE WHEN position IS NULL THEN 9999 ELSE position END ASC, created_at ASC`,
-        (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        }
+  async getChallengeById(id) {
+    const res = await this.pool.query(`SELECT * FROM challenges WHERE id = $1`, [id]);
+    return res.rows[0];
+  }
+
+  async getQueue(includeUsed = false) {
+    const condition = includeUsed ? '1=1' : "status != 'used'";
+    const res = await this.pool.query(
+      `SELECT id, title, difficulty, status, position, scheduled_post_at, scheduled_message_id
+       FROM challenges
+       WHERE ${condition}
+       ORDER BY COALESCE(position, 9999), created_at ASC`
+    );
+    return res.rows;
+  }
+
+  async approveChallenge(id) {
+    await this.pool.query(
+      `UPDATE challenges
+       SET status = 'approved', scheduled_post_at = NULL, scheduled_message_id = NULL
+       WHERE id = $1`,
+      [id]
+    );
+    await this.recalculatePositions();
+  }
+
+  async markScheduled(id, postAtEpoch, scheduledMessageId) {
+    await this.pool.query(
+      `UPDATE challenges
+       SET status = 'approved', scheduled_post_at = $1, scheduled_message_id = $2
+       WHERE id = $3`,
+      [postAtEpoch, scheduledMessageId, id]
+    );
+  }
+
+  async reorderChallenge(id, newPosition) {
+    const res = await this.pool.query(
+      `SELECT position FROM challenges WHERE id = $1`,
+      [id]
+    );
+    if (res.rows.length === 0) return;
+    const oldPosition = res.rows[0].position;
+
+    if (oldPosition === null) {
+      // If challenge didn’t have a position, insert it and shift down
+      await this.pool.query(
+        `UPDATE challenges SET position = position + 1 WHERE position >= $1 AND position IS NOT NULL`,
+        [newPosition]
       );
-    });
-  }
-
-  approveChallenge(id) {
-    return new Promise((resolve, reject) => {
-      // Set challenge to approved, set scheduled_post_at/message_id
-      this.db.run(`
-        UPDATE challenges
-        SET status = 'approved', scheduled_post_at = NULL, scheduled_message_id = NULL
-        WHERE id = ?
-      `, [id], (err) => {
-        if (err) return reject(err);
-        this.recalculatePositions().then(resolve).catch(reject);
-      });
-    });
-  }
-
-  markScheduled(id, postAtEpoch, scheduledMessageId) {
-    return new Promise((resolve, reject) => {
-      this.db.run(
-        `UPDATE challenges
-         SET status = 'approved', scheduled_post_at = ?, scheduled_message_id = ?
-         WHERE id = ?`,
-        [postAtEpoch, scheduledMessageId, id],
-        (err) => (err ? reject(err) : resolve())
+      await this.pool.query(`UPDATE challenges SET position = $1 WHERE id = $2`, [
+        newPosition,
+        id,
+      ]);
+    } else if (newPosition < oldPosition) {
+      // Moving up
+      await this.pool.query(
+        `UPDATE challenges SET position = position + 1
+         WHERE position >= $1 AND position < $2 AND id != $3 AND position IS NOT NULL`,
+        [newPosition, oldPosition, id]
       );
-    });
+      await this.pool.query(`UPDATE challenges SET position = $1 WHERE id = $2`, [
+        newPosition,
+        id,
+      ]);
+    } else if (newPosition > oldPosition) {
+      // Moving down
+      await this.pool.query(
+        `UPDATE challenges SET position = position - 1
+         WHERE position > $1 AND position <= $2 AND id != $3 AND position IS NOT NULL`,
+        [oldPosition, newPosition, id]
+      );
+      await this.pool.query(`UPDATE challenges SET position = $1 WHERE id = $2`, [
+        newPosition,
+        id,
+      ]);
+    }
   }
 
-  reorderChallenge(id, newPosition) {
-    return new Promise((resolve, reject) => {
-      this.db.get(`SELECT position FROM challenges WHERE id = ?`, [id], (err, row) => {
-        if (err) return reject(err);
-        const oldPosition = row.position;
-
-        if (oldPosition == null) {
-          // If the challenge didn't have a position, just insert it and shift down
-          this.db.run(
-            `UPDATE challenges SET position = position + 1 WHERE position >= ? AND position IS NOT NULL`,
-            [newPosition],
-            (err2) => {
-              if (err2) return reject(err2);
-              this.db.run(
-                `UPDATE challenges SET position = ? WHERE id = ?`,
-                [newPosition, id],
-                (err3) => (err3 ? reject(err3) : resolve())
-              );
-            }
-          );
-        } else if (newPosition < oldPosition) {
-          // Moving up: shift down those at or above newPosition and below oldPosition
-          this.db.run(
-            `UPDATE challenges SET position = position + 1
-             WHERE position >= ? AND position < ? AND id != ? AND position IS NOT NULL`,
-            [newPosition, oldPosition, id],
-            (err2) => {
-              if (err2) return reject(err2);
-              this.db.run(
-                `UPDATE challenges SET position = ? WHERE id = ?`,
-                [newPosition, id],
-                (err3) => (err3 ? reject(err3) : resolve())
-              );
-            }
-          );
-        } else if (newPosition > oldPosition) {
-          // Moving down: shift up those between oldPosition and newPosition
-          this.db.run(
-            `UPDATE challenges SET position = position - 1
-             WHERE position > ? AND position <= ? AND id != ? AND position IS NOT NULL`,
-            [oldPosition, newPosition, id],
-            (err2) => {
-              if (err2) return reject(err2);
-              this.db.run(
-                `UPDATE challenges SET position = ? WHERE id = ?`,
-                [newPosition, id],
-                (err3) => (err3 ? reject(err3) : resolve())
-              );
-            }
-          );
-        } else {
-          resolve();
-        }
-      });
-    });
-  }
-
-  removeChallenge(id) {
-    return new Promise((resolve, reject) => {
-      this.db.run(`DELETE FROM challenges WHERE id = ?`, [id], (err) => {
-        if (err) return reject(err);
-        this.recalculatePositions().then(resolve).catch(reject);
-      });
-    });
+  async removeChallenge(id) {
+    await this.pool.query(`DELETE FROM challenges WHERE id = $1`, [id]);
+    await this.recalculatePositions();
   }
 
   async recalculatePositions() {
-    return new Promise((resolve, reject) => {
-      // Get all approved/scheduled challenges ordered by scheduled_post_at
-      this.db.all(`SELECT id FROM challenges WHERE status IN ('approved', 'scheduled') ORDER BY scheduled_post_at ASC, id ASC`, [], (err, approvedRows) => {
-        if (err) return reject(err);
-        // Get all pending challenges ordered by manual position
-        this.db.all(`SELECT id FROM challenges WHERE status = 'pending' ORDER BY position ASC, id ASC`, [], (err2, pendingRows) => {
-          if (err2) return reject(err2);
-          let updates = [];
-          let pos = 1;
-          for (const row of approvedRows) {
-            updates.push({ id: row.id, position: pos++ });
-          }
-          for (const row of pendingRows) {
-            updates.push({ id: row.id, position: pos++ });
-          }
-          let remaining = updates.length;
-          if (remaining === 0) return resolve();
-          for (const u of updates) {
-            this.db.run(`UPDATE challenges SET position = ? WHERE id = ?`, [u.position, u.id], (err3) => {
-              if (err3) return reject(err3);
-              remaining--;
-              if (remaining === 0) resolve();
-            });
-          }
-        });
-      });
-    });
-  }
+    // Get approved/scheduled challenges ordered by scheduled_post_at
+    const approved = await this.pool.query(
+      `SELECT id FROM challenges 
+       WHERE status IN ('approved', 'scheduled') 
+       ORDER BY scheduled_post_at ASC, id ASC`
+    );
 
+    // Get pending challenges ordered by manual position
+    const pending = await this.pool.query(
+      `SELECT id FROM challenges 
+       WHERE status = 'pending' 
+       ORDER BY position ASC, id ASC`
+    );
+
+    let pos = 1;
+    const updates = [];
+
+    for (const row of approved.rows) {
+      updates.push({ id: row.id, position: pos++ });
+    }
+    for (const row of pending.rows) {
+      updates.push({ id: row.id, position: pos++ });
+    }
+
+    for (const u of updates) {
+      await this.pool.query(`UPDATE challenges SET position = $1 WHERE id = $2`, [
+        u.position,
+        u.id,
+      ]);
+    }
+  }
 }
 
 module.exports = Database;

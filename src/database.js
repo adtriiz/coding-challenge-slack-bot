@@ -5,7 +5,9 @@ class Database {
   constructor() {
     this.pool = new Pool({
       connectionString: process.env.DATABASE_URL, // Supabase/Postgres connection string
-      ssl: { rejectUnauthorized: false }
+      ssl: { rejectUnauthorized: false },
+      max: 5, // Limit to 5 connections
+      idleTimeoutMillis: 30000 // 30 seconds
     });
   }
 
